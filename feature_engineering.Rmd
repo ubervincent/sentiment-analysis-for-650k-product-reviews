@@ -1,0 +1,61 @@
+---
+title: "Feature Engineering for Sentiment Analysis Task"
+author: "Vincent Lam, Cindy Inanto"
+date: "01/05/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Assignment 2 - Sentiment Analysis
+
+## Library
+```{r}
+library(tidyverse)
+library(tidytext)
+library(coreNLP)
+library(wordcloud)
+```
+
+## Importing
+```{r}
+train <- read_csv("~/Google Drive/Monash/Semester 3/FIT5149/Assessment/Assessment 2/Training Dataset/train_data.csv")
+label <- read_csv("~/Google Drive/Monash/Semester 3/FIT5149/Assessment/Assessment 2/Training Dataset/train_label.csv")
+
+label %>% 
+  View()
+```
+
+## Text-preprocessing
+The end goal in this process is to put the train data into a tidy format. As suggested by the book Text Mining with R, it is better to put the train data into a one-term-per-row format rather than a more conventional document-term matrix as one-term-per-row format allows for easy conversion into different formats for machine learning application, interpretation and visualisation. 
+
+One thing to note also is that the entire workflow is likely to be iterative. Meaning that we might come back and revisit our preprocessing approach for to better train our learner. 
+
+We will first put the train set into a tibble format.
+
+```{r}
+df <- tibble(line=1:650000, text=train$text)
+```
+
+```{r}
+tokens <- df %>% 
+  unnest_tokens(word, text)
+```
+
+```{r}
+tokens %>% view()
+```
+
+### N-gram Feature
+
+### Unigram Feature
+
+### POS Tag and NER Tag
+
+### TF-IDF
+
+### Reference
+https://www.tidytextmining.com/tidytext.html
+
