@@ -15,17 +15,15 @@ knitr::opts_chunk$set(echo = TRUE)
 ```{r}
 library(tidyverse)
 library(tidytext)
-library(coreNLP)
 library(wordcloud)
+library(coreNLP)
+library(tm)
 ```
 
 ## Importing
 ```{r}
-train <- read_csv("~/Google Drive/Monash/Semester 3/FIT5149/Assessment/Assessment 2/Training Dataset/train_data.csv")
-label <- read_csv("~/Google Drive/Monash/Semester 3/FIT5149/Assessment/Assessment 2/Training Dataset/train_label.csv")
-
-label %>% 
-  View()
+train <- read_csv("~/Google Drive/Monash/Semester 3/FIT5149/Assessment/Assessment 2/src/Training Dataset/train_data.csv")
+label <- read_csv("~/Google Drive/Monash/Semester 3/FIT5149/Assessment/Assessment 2/src/Training Dataset/train_label.csv")
 ```
 
 ## Text-preprocessing
@@ -36,25 +34,122 @@ One thing to note also is that the entire workflow is likely to be iterative. Me
 We will first put the train set into a tibble format.
 
 ```{r}
+# put into dataframe/tibble
 df <- tibble(line=1:650000, text=train$text)
+label <- tibble(line=1:650000, text=label$label)
+
 ```
 
+We will then remove words that are not meaningful which include digits and puctuations. 
 ```{r}
+
+# remove puctuations and digits
+df <- df %>% 
+ mutate(text = str_replace_all(text, "[[:punct:]]|[[:digit:]]", "")) 
+```
+
+This R function is one token per row format 
+### Tokenization and stopwords
+```{r}
+# unnest_tokens function to tokenize the frame and remove the stopwords using anti_join()
 tokens <- df %>% 
-  unnest_tokens(word, text)
+  unnest_tokens(word, text) %>% 
+  anti_join(stop_words)
 ```
+
+### Term-Frequency and IDF
+Term-frequency and inverse document frequency can help us understand which tokens are common to all reviews and which are comon
+```{r}
+tokens <- tokens %>% 
+  count(line, word) %>% 
+  bind_tf_idf(word, line, n)
+```
+
+### Rare words
+Given the dataset having contained 650,000 records, words that do not occur more than 10 times are highly likely to be noise that will negatively affect the performance of the learner. 
+
+But where exactly should we cut off the words? We should cut off words where they provide no additional value, which could be frequent. We will look at the words that appeared the most in the corpus by using wordcloud 
 
 ```{r}
-tokens %>% view()
+wc <- tokens %>% 
+  count(word)
+
+# wordcloud
+wordcloud(words = wc$word, freq=wc$n, max.words = 20, 
+          rot.per=0.35, 
+          colors=brewer.pal(7, "Dark2"))
 ```
 
-### N-gram Feature
+As we can see the most frequent words are 'food', 'service', 'time', and 'dont'. One thing we can do to assess the information it contains is to plot the distribution of sentiment scores of lines that contain these words
 
-### Unigram Feature
+```{r}
+tokens %>%
+  filter_at(vars(word %in% c('food', 'service', 'time','dont'))) %>% 
+  View()
+```
 
-### POS Tag and NER Tag
+## Feature Engineering
 
-### TF-IDF
+### Bigram Feature
+We can use the same unnest function to generate bigrams. We will first generate all the bigrams, and then retain the bigrams that could help the analysis by s
+```{r}
+bigrams <- df %>%
+  unnest_tokens(word, text, token='ngrams', n=2)
+```
+
+Stopwords for bigrams
+```{r}
+bigrams %>% 
+  count(line, word) %>% 
+  bind_tf_idf(word, line, n) %>% 
+  View()
+```
+
+### Sentiment lexicon 
+We will use sentiment lexicon to get the sentiment score for each token 
+```{r}
+sentiment <- get_sentiments("afinn")
+
+# join the sentiment words with token
+tokens <- tokens %>% 
+  left_join(sentiment)
+
+write.csv(tokens, file= 'tokens_sentiment_tfidf')
+```
+
+Aside from sentiment score, we could engineer another feature called emotional strength, much like Google NLP by squaring the score and normalizing it. The reason for that is because emotionally charged text intuitively makes for a good predictor as they tend to go to an extreme (1 or 5). 
+
+## Matrix
+```{r}
+dtm <- tokens %>% 
+  count(line, word) %>% 
+  cast_dtm(document=line, term=word, value=n)
+```
+
+Removing sparse terms
+```{r}
+dtm <- removeSparseTerms(dtm, sparse = .99)
+```
+
+
+## Training 
+
+
+```{r}
+library(caret)
+
+y <- label %>% 
+  slice(1:10000) %>% 
+  
+
+system.time({
+  pred_rf_10 <- train(x = as.matrix(dtm),
+                      y = factor(y$text),
+                      method = 'rf',
+                      ntree = 10,
+                      trControl = trainControl(method = 'oob'))
+})
+```
 
 ### Reference
 https://www.tidytextmining.com/tidytext.html
