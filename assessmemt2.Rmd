@@ -1,0 +1,255 @@
+---
+title: "Assignment 2 - Sentiment Analysis"
+author: "Vincent Lam, Cindy Inanto"
+date: "01/05/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# libraries
+library(tidyverse)
+library(quanteda)
+library(caret)
+library(xgboost)
+library(randomForest)
+
+library(glmnet)
+require(doMC)
+
+# importing the data
+train <- read_csv("~/Google Drive/Monash/Semester 3/FIT5149/Assessment/Assessment 2/src/Training Dataset/train_data.csv")
+label <- read_csv("~/Google Drive/Monash/Semester 3/FIT5149/Assessment/Assessment 2/src/Training Dataset/train_label.csv")
+
+train <- merge(x=train, y=label, by='trn_id')
+
+# set the memory limit to whatever is possible
+memory.limit(size = NA)
+
+# quanteda options settings
+quanteda_options(verbose = TRUE)
+quanteda_options(threads = 8)
+```
+
+# Base Models
+```{r Train Test Split}
+# use a smaller subset to perform analysis
+train <- train[1:6500,]
+
+set.seed(192)
+
+# size of the sample 
+sample <- floor(0.7*nrow(train))
+
+train_dfm <- train %>% 
+  corpus() %>% 
+  dfm(remove_punct=TRUE, 
+      remove=stopwords("english")) %>% 
+  dfm_sample(size=sample,
+             margin='documents') 
+
+test_dfm <- train %>% 
+  corpus() %>% 
+  corpus_subset(!docnames(.) %in% docnames(train_dfm)) %>% 
+  dfm(remove_punct=TRUE, 
+      remove=stopwords("english")) %>% 
+  # make sure the dfm has all the features train dfm has
+  dfm_select(pattern=train_dfm,
+             selection='keep')
+```
+
+```{r Accurary Evaluation}
+# accuracy function to evaluate predictions
+accuracy <- function(ypred, y){
+    tab <- table(ypred, y)
+    return(sum(diag(tab))/sum(tab))
+}
+```
+
+## Naive Baysian Model
+Quanteda library comes with a naive baysian classifier and we will quickly set a benchmark for the task
+
+https://tutorials.quanteda.io/machine-learning/nb/
+
+```{r Naive Baysian With Full Set of Tokens}
+# the model and prediction with full feature set
+nb_full <- textmodel_nb(train_dfm, 
+                        docvars(train_dfm, 'label'), 
+                        prior='docfreq')
+
+pred1 <- predict(nb_full, newdata=test_dfm)
+
+# scoring
+accuracy(docvars(test_dfm, 'label'), pred1)
+```
+
+```{r Naive Baysian With Trimed DFM}
+train_dfm
+
+# has to appear in at least 0.5 percent of the documents
+train_slim <- dfm_trim(train_dfm,
+                     max_docfreq = 0.95,
+                     min_docfreq = 0.05,
+                     docfreq_type = "prop",
+                     verbose = TRUE)
+
+# feature set 
+test_slim <- dfm_match(test_dfm, 
+                  features = featnames(train_slim))
+train_slim
+
+# the model and prediction
+nb_slim <- textmodel_nb(train_slim, 
+                        docvars(train_dfm, 'label'),
+                        prior='docfreq')
+
+pred2 <- predict(nb_slim, newdata=test_slim)
+
+# scoring
+accuracy(docvars(test_slim, 'label'), pred2)
+```
+
+## Support Vector Machine
+```{r SVM with parameter tuning}
+library(e1071)
+
+svm_model <- tune(svm, train.x=train_slim, 
+            train.y=factor(docvars(train_slim, 'label')),
+            kernel="linear",
+            ranges=list(cost=c(0.1, 1, 5, 10)))
+
+pred3 <- predict(svm_model$best.model, newdata=test_slim)
+
+accuracy(docvars(test_slim, 'label'), pred3)
+```
+
+## Random Forrest
+```{r Random Forrest}
+library(randomForest)
+
+rf_train <- convert(train_slim, to='data.frame')[,-1]
+rf_test <- convert(test_slim, to='data.frame')[,-1]
+
+rf <- randomForest(x=rf_train, 
+                   y=factor(docvars(train_slim, 'label')),
+                   xtest=rf_test,
+                   ytest=factor(docvars(test_slim, 'label')),
+                   importance=TRUE,
+                   mtry=20,
+                   ntree=100,
+                   keep.forest=TRUE
+                   )
+
+pred4 <- predict(rf, rf_test, type="response")
+accuracy(docvars(test_slim, 'label'), pred4)
+```
+
+## Logistic Regression
+```{r Logistic Regression}
+registerDoMC(cores=3)
+ridge <- cv.glmnet(train_slim, factor(docvars(train_slim, 'label')), 
+    family="multinomial", alpha=0, nfolds=10, parallel=TRUE, intercept=TRUE,
+    type.measure="class")
+
+pred5 <- predict(ridge, test_slim, type="class")
+
+accuracy(docvars(test_slim, 'label'), pred5)
+```
+
+## Extreme Gradient Boosting
+
+```{r}
+xgb <- xgboost(data = convert(dfm_slim, to='data.frame')[,-1], 
+ label = docvars(dfm_slim, 'label'), 
+ eta = 0.1,
+ max_depth = 15, 
+ nround=25, 
+ subsample = 0.5,
+ colsample_bytree = 0.5,
+ seed = 1,
+ eval_metric = "merror",
+ objective = "multi:softprob",
+ num_class = 12,
+ nthread = 3
+)
+```
+
+# Feature Selection & Extraction
+## TF-IDF Normalization
+It won't be a big improvement as shown in [2].
+
+```{r Tf-idf Normalization}
+train_tfidf <- train_slim %>% 
+  dfm_tfidf(scheme_tf = "count", 
+            scheme_df = "inverse", 
+            base = 10,
+            force = FALSE)
+
+test_tfidf <- dfm_match(test_dfm, 
+                  features = featnames(train_tfidf))
+
+```
+
+```{r Chi-squared }
+chi_dfm <- dfm_group(train_dfm, 
+          groups = 'label')
+
+textstat_keyness(chi_dfm, target = 2)
+```
+
+```{r Bigrams}
+tok1 <- tokens(train$text[1:100000], ngrams=1:2, 
+               remove_punct=TRUE)
+tok2 <- tokens(train$text[100001:200000],ngrams=1:2,
+              remove_punct=TRUE)
+tok3 <- tokens(train$text[200001:300000],ngrams=1:2,
+              remove_punct=TRUE)
+tok4 <- tokens(train$text[300001:400000],ngrams=1:2,
+              remove_punct=TRUE)
+tok5 <- tokens(train$text[400001:500000],ngrams=1:2,
+              remove_punct=TRUE)
+tok6 <- tokens(train$text[500001:600000],ngrams=1:2,
+              remove_punct=TRUE)
+tok7 <- tokens(train$text[600001:650000],ngrams=1:2,
+              remove_punct=TRUE)
+
+
+dfm1 <- dfm(tok1, remove=stopwords("english"), verbose=TRUE)
+dfm2 <- dfm(tok2, remove=stopwords("english"), verbose=TRUE)
+dfm3 <- dfm(tok2, remove=stopwords("english"), verbose=TRUE)
+dfm4 <- dfm(tok2, remove=stopwords("english"), verbose=TRUE)
+dfm5 <- dfm(tok2, remove=stopwords("english"), verbose=TRUE)
+dfm6 <- dfm(tok2, remove=stopwords("english"), verbose=TRUE)
+dfm7 <- dfm(tok2, remove=stopwords("english"), verbose=TRUE)
+
+# combine all dfm into 1 and compress redundant features/words
+dfm <- rbind(dfm1, dfm2, dfm3, dfm4, dfm5, dfm6, dfm7) %>% 
+dfm_compress(margin='features')
+# change document to correct numbers
+```
+
+```{r Negation}
+tokens_compound()
+```
+
+```{r EDA on labels}
+library(mldr)
+
+```
+
+```{r Sentiment Feature}
+
+# AFINN sentiment -5 - 5
+sentiment <- get_sentiments("afinn")
+
+# join the sentiment words with token
+tokens <- tokens %>% 
+  left_join(sentiment)
+```
+
+
+### Reference
+https://www.tidytextmining.com/tidytext.html
+2. https://appliedmachinelearning.blog/2017/02/12/sentiment-analysis-using-tf-idf-weighting-pythonscikit-learn/
+
