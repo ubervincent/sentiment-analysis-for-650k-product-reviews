@@ -14,8 +14,10 @@ library(quanteda)
 library(caret)
 library(xgboost)
 library(randomForest)
-
 library(glmnet)
+library(parallel)
+library(parallelMap) 
+library(text2vec)
 require(doMC)
 
 # importing the data
@@ -30,6 +32,9 @@ memory.limit(size = NA)
 # quanteda options settings
 quanteda_options(verbose = TRUE)
 quanteda_options(threads = 8)
+
+# use all cores
+parallelStartSocket(cpus = detectCores())
 ```
 
 # Base Models
@@ -37,7 +42,7 @@ quanteda_options(threads = 8)
 # use a smaller subset to perform analysis
 train <- train[1:6500,]
 
-set.seed(192)
+set.seed(162)
 
 # size of the sample 
 sample <- floor(0.7*nrow(train))
@@ -45,6 +50,7 @@ sample <- floor(0.7*nrow(train))
 train_dfm <- train %>% 
   corpus() %>% 
   dfm(remove_punct=TRUE, 
+      removeNumbers = TRUE,
       remove=stopwords("english")) %>% 
   dfm_sample(size=sample,
              margin='documents') 
@@ -57,14 +63,27 @@ test_dfm <- train %>%
   # make sure the dfm has all the features train dfm has
   dfm_select(pattern=train_dfm,
              selection='keep')
-```
 
-```{r Accurary Evaluation}
-# accuracy function to evaluate predictions
+train_slim <- dfm_trim(train_dfm,
+                     sparsity=0.95,
+                     min_docfreq = 0.05,
+                     docfreq_type = "prop",
+                     verbose = TRUE)
+
+# test set 
+test_slim <- dfm_match(test_dfm, 
+                  features = featnames(train_slim))
+
+# accuracy function for evaluation
 accuracy <- function(ypred, y){
     tab <- table(ypred, y)
     return(sum(diag(tab))/sum(tab))
 }
+```
+
+```{r Accurary Evaluation}
+# accuracy function to evaluate predictions
+
 ```
 
 ## Naive Baysian Model
@@ -74,105 +93,130 @@ https://tutorials.quanteda.io/machine-learning/nb/
 
 ```{r Naive Baysian With Full Set of Tokens}
 # the model and prediction with full feature set
-nb_full <- textmodel_nb(train_dfm, 
-                        docvars(train_dfm, 'label'), 
+
+nb_model <- function(train, test){
+  print(train)
+  nb <- textmodel_nb(train, 
+                        docvars(train, 'label'), 
                         prior='docfreq')
 
-pred1 <- predict(nb_full, newdata=test_dfm)
+  pred <- predict(nb, newdata=test)
 
-# scoring
-accuracy(docvars(test_dfm, 'label'), pred1)
+  # scoring
+  accuracy(docvars(test, 'label'), pred)
+}
+
+nb_model(train_dfm, test_dfm)
 ```
+
 
 ```{r Naive Baysian With Trimed DFM}
 train_dfm
 
 # has to appear in at least 0.5 percent of the documents
-train_slim <- dfm_trim(train_dfm,
-                     max_docfreq = 0.95,
-                     min_docfreq = 0.05,
-                     docfreq_type = "prop",
-                     verbose = TRUE)
 
-# feature set 
-test_slim <- dfm_match(test_dfm, 
-                  features = featnames(train_slim))
-train_slim
-
-# the model and prediction
-nb_slim <- textmodel_nb(train_slim, 
-                        docvars(train_dfm, 'label'),
-                        prior='docfreq')
-
-pred2 <- predict(nb_slim, newdata=test_slim)
-
-# scoring
-accuracy(docvars(test_slim, 'label'), pred2)
+nb_model(train_slim, test_slim)
 ```
 
 ## Support Vector Machine
 ```{r SVM with parameter tuning}
 library(e1071)
 
-svm_model <- tune(svm, train.x=train_slim, 
-            train.y=factor(docvars(train_slim, 'label')),
-            kernel="linear",
+svm_model <- function(train, test){
+  svm_model <- tune(svm, train.x=train, 
+            train.y=factor(docvars(train, 'label')),
+            type='C-classification',
+            kernel='radial',
             ranges=list(cost=c(0.1, 1, 5, 10)))
 
-pred3 <- predict(svm_model$best.model, newdata=test_slim)
+  pred <- predict(svm_model$best.model, newdata=test)
 
-accuracy(docvars(test_slim, 'label'), pred3)
+  accuracy(docvars(test, 'label'), pred)
+}
+
+svm_model(train_slim, test_slim)
+```
+
+## Logistic Regression
+```{r Logistic Regression}
+
+log_model <- function(train, test, fold){
+  registerDoMC(cores=3)
+  ridge <- cv.glmnet(train, factor(docvars(train, 'label')), 
+      family="multinomial", alpha=1, nfolds=fold, parallel=TRUE, intercept=TRUE,
+      type.measure="class")
+  
+  pred <- predict(ridge, test, type="class")
+  
+  accuracy(docvars(test, 'label'), pred)
+}
+
+log_model(train_slim, test_slim, 30)
+```
+
+```{r}
+?registerDoMC()
 ```
 
 ## Random Forrest
 ```{r Random Forrest}
 library(randomForest)
 
-rf_train <- convert(train_slim, to='data.frame')[,-1]
-rf_test <- convert(test_slim, to='data.frame')[,-1]
+rf_model <- function(train, test, try, ntree){
+  df_train <- convert(train, to='data.frame')[,-1]
+  df_test <- convert(test, to='data.frame')[,-1]
 
-rf <- randomForest(x=rf_train, 
-                   y=factor(docvars(train_slim, 'label')),
-                   xtest=rf_test,
-                   ytest=factor(docvars(test_slim, 'label')),
-                   importance=TRUE,
-                   mtry=20,
-                   ntree=100,
-                   keep.forest=TRUE
-                   )
+  rf <- randomForest(x=df_train, 
+                     y=factor(docvars(train, 'label')),
+                     xtest=df_test,
+                     ytest=factor(docvars(test, 'label')),
+                     importance=TRUE,
+                     mtry=try,
+                     ntree=ntree,
+                     keep.forest=TRUE
+                     )
 
-pred4 <- predict(rf, rf_test, type="response")
-accuracy(docvars(test_slim, 'label'), pred4)
+  pred <- predict(rf, df_test, type="response")
+  accuracy(docvars(test, 'label'), pred)
+}
+
+rf_model(train_slim, test_slim, 20, 100)
 ```
 
-## Logistic Regression
-```{r Logistic Regression}
-registerDoMC(cores=3)
-ridge <- cv.glmnet(train_slim, factor(docvars(train_slim, 'label')), 
-    family="multinomial", alpha=0, nfolds=10, parallel=TRUE, intercept=TRUE,
-    type.measure="class")
-
-pred5 <- predict(ridge, test_slim, type="class")
-
-accuracy(docvars(test_slim, 'label'), pred5)
-```
-
-## Extreme Gradient Boosting
-
+## XGBoost Random Forrest
 ```{r}
-xgb <- xgboost(data = convert(dfm_slim, to='data.frame')[,-1], 
- label = docvars(dfm_slim, 'label'), 
- eta = 0.1,
- max_depth = 15, 
- nround=25, 
- subsample = 0.5,
- colsample_bytree = 0.5,
- seed = 1,
- eval_metric = "merror",
- objective = "multi:softprob",
- num_class = 12,
- nthread = 3
-)
+
+xgb_model <- function(train, test, round, eta, dep){
+  # change to dataframe
+  df_train <- convert(train, to='data.frame')[,-1]
+  df_test <- convert(test, to='data.frame')[,-1]
+  
+  # info about the documents
+  print(train)
+  
+  # model
+  xgb <- xgboost(data = as.matrix(df_train), 
+  # label must be in [0, num_class) rather than 1 - 5
+  label =  (as.numeric(docvars(train, 'label'))-1), 
+  eta = eta,
+  max_depth = dep, 
+  nround=round, 
+  gamma=5,
+  subsample = 0.6,
+  booster = 'gbtree',
+  early_stopping_round = 20,
+  colsample_bytree = 0.7,
+  seed = 1,
+  eval_metric = "merror",
+  objective = "multi:softmax",
+  num_class = 5,
+  )
+  
+  pred <- predict(xgb, test) + 1
+  accuracy(docvars(test, 'label'), pred)
+}
+
+xgb_model(train_slim, test_slim, 5, 0.2, 10)
 ```
 
 # Feature Selection & Extraction
@@ -191,53 +235,137 @@ test_tfidf <- dfm_match(test_dfm,
 
 ```
 
+## Chi-squared
+[5] 
 ```{r Chi-squared }
-chi_dfm <- dfm_group(train_dfm, 
-          groups = 'label')
+chi2 <- dfm_group(train_slim, 
+          groups = 'label') %>% 
+  textstat_keyness()
 
-textstat_keyness(chi_dfm, target = 2)
+chi2$chi2 <- abs(chi2$chi2)
+
+chi2 <- chi2[order(chi2$chi2, decreasing = TRUE), ]
+head(chi2,10)
+
+train_chi <- train_dfm %>% 
+  dfm_select(chi2$feature)
+
+test_chi <- dfm_match(test_dfm, 
+                  features = featnames(train_chi))
+
+xgb_model(train_slim, test_slim, 5, 0.2, 10)
+xgb_model(train_chi, test_chi, 5, 0.2, 10)
+xgb_model(train_tfidf, test_tfidf, 5, 0.2, 10)
+
+rf_model(train_slim, test_slim, 20, 50)
+rf_model(train_chi, test_chi, 20, 50)
+rf_model(train_tfidf, test_tfidf, 20, 50)
+
+nb_model(train_slim, test_slim)
+nb_model(train_chi, test_chi)
+
+log_model(train_slim, test_slim, 30)
+log_model(train_chi, test_chi, 30)
+log_model(train_tfidf, test_tfidf, 30)
 ```
 
+
+## Ngrams Features
 ```{r Bigrams}
-tok1 <- tokens(train$text[1:100000], ngrams=1:2, 
-               remove_punct=TRUE)
-tok2 <- tokens(train$text[100001:200000],ngrams=1:2,
-              remove_punct=TRUE)
-tok3 <- tokens(train$text[200001:300000],ngrams=1:2,
-              remove_punct=TRUE)
-tok4 <- tokens(train$text[300001:400000],ngrams=1:2,
-              remove_punct=TRUE)
-tok5 <- tokens(train$text[400001:500000],ngrams=1:2,
-              remove_punct=TRUE)
-tok6 <- tokens(train$text[500001:600000],ngrams=1:2,
-              remove_punct=TRUE)
-tok7 <- tokens(train$text[600001:650000],ngrams=1:2,
-              remove_punct=TRUE)
 
+train_ngrams <- train %>% 
+  dfm(stem=TRUE,
+      remove=stopwords("english"), 
+      ngrams=1:3, 
+      verbose=TRUE)
 
-dfm1 <- dfm(tok1, remove=stopwords("english"), verbose=TRUE)
-dfm2 <- dfm(tok2, remove=stopwords("english"), verbose=TRUE)
-dfm3 <- dfm(tok2, remove=stopwords("english"), verbose=TRUE)
-dfm4 <- dfm(tok2, remove=stopwords("english"), verbose=TRUE)
-dfm5 <- dfm(tok2, remove=stopwords("english"), verbose=TRUE)
-dfm6 <- dfm(tok2, remove=stopwords("english"), verbose=TRUE)
-dfm7 <- dfm(tok2, remove=stopwords("english"), verbose=TRUE)
+```
 
-# combine all dfm into 1 and compress redundant features/words
-dfm <- rbind(dfm1, dfm2, dfm3, dfm4, dfm5, dfm6, dfm7) %>% 
-dfm_compress(margin='features')
-# change document to correct numbers
+## Specific Words Features
+```{r EDA on labels}
+library(mldr)
+
 ```
 
 ```{r Negation}
 tokens_compound()
 ```
 
-```{r EDA on labels}
-library(mldr)
+```{r Key words}
+# create tokens from iterator
+vocab <- it_train %>% 
+  create_vocabulary(stopwords=stopwords('english'), 
+                    ngram = c(ngram_min = 1L,
+                               ngram_max = 3L)) %>% 
+  prune_vocabulary(term_count_min = 10, 
+                   doc_proportion_max = 0.5,
+                   doc_proportion_min = 0.001)
 
+# vectorize the vocab
+vect <- vocab_vectorizer(vocab)
 ```
 
+# God Speed
+```{r Text2Vec}
+# train test
+set.seed(100)
+
+smp_size <- floor(0.75 * nrow(train))
+
+split<-sample(seq_len(nrow(train)), size = smp_size)
+train_df <- train[split,]
+test_df <- train_df[-split,]
+
+# preprocessing functions
+prep_fun = tolower
+tok_fun = word_tokenizer
+
+# iterator to apply functions on token
+it_train <- itoken(train_df$text, 
+             preprocessor = prep_fun, 
+             tokenizer = tok_fun, 
+             ids = train_df$trn_id, 
+             progressbar = TRUE)
+
+it_test <- itoken(test_df$text, 
+             preprocessor = prep_fun, 
+             tokenizer = tok_fun, 
+             ids = test_df$trn_id, 
+             progressbar = TRUE)
+
+hash <- hash_vectorizer(hash_size = 2 ^ 16, 
+                        ngram = c(ngram_min = 1L,
+                                  ngram_max = 2L))
+# tfidf
+tfidf <- TfIdf$new()
+
+# create dfm using ngram vectorizer
+dtm_train <- it_train %>% 
+  create_dtm(hash) %>% 
+  normalize("l1") %>% 
+  fit_transform(tfidf) 
+  
+dtm_test = it_test %>% 
+  create_dtm(hash) %>% 
+  normalize("l1") %>% 
+  transform(tfidf)
+
+dim(dtm_train)
+dim(dtm_test)
+```
+```{r God Speed}
+registerDoMC(cores=detectCores())
+ridge <- cv.glmnet(dtm_train, factor(train_df$label), 
+      family="multinomial", alpha=1, nfolds=5, parallel=TRUE, intercept=TRUE,
+      type.measure="class")
+  
+pred <- predict(ridge, dtm_test, type="class")
+  
+accuracy(test_df$label, pred)
+```
+
+
+## Sentiment Scores 
 ```{r Sentiment Feature}
 
 # AFINN sentiment -5 - 5
@@ -248,8 +376,20 @@ tokens <- tokens %>%
   left_join(sentiment)
 ```
 
+# Model Tuning
+[3] states the optimal cv folds
+
+[4] How to tune parameter
+```{r Parameter tuning}
+
+```
+
 
 ### Reference
 https://www.tidytextmining.com/tidytext.html
 2. https://appliedmachinelearning.blog/2017/02/12/sentiment-analysis-using-tf-idf-weighting-pythonscikit-learn/
+3. http://appliedpredictivemodeling.com/blog/2014/11/27/vpuig01pqbklmi72b8lcl3ij5hj2qm
+4. https://www.hackerearth.com/practice/machine-learning/machine-learning-algorithms/beginners-tutorial-on-xgboost-parameter-tuning-r/tutorial/
+5. https://stackoverflow.com/questions/38538821/feature-selection-in-document-feature-matrix-by-using-chi-squared-test
+
 
